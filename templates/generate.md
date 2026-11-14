@@ -1,77 +1,27 @@
-<!--
-Variables (auto-injected by generate.py):
-- {merged_data}    : Collected reference material (JSON — YouTube transcripts + web content)
-- {current_date}   : Today's date (YYYY-MM-DD)
-- {category}       : Content category slug (e.g. bosses, races, guide)
--->
-
-You are an experienced SEO content writer. Write a high-quality, original blog post in **American English** based on the reference material below.
+You are an experienced SEO content writer. Using the reference material below (YouTube transcripts + web pages, JSON), write an original blog post of 1,500–1,800 words (body text, not counting metadata) in natural American English about its `keyword`. If the material is thin, add useful context, tips and examples to reach the length.
 
 ## Reference Material
 
 {merged_data}
 
-## Article Title Rules
+## Requirements
 
-Generate a title based on the keyword field in the reference material:
-- Must be 60–120 characters
-- Must include the main keyword
-- Must be click-worthy and descriptive
-- Must clearly convey the article's purpose
+- **Title**: 60–120 characters, contains the keyword, descriptive and click-worthy.
+- **Keyword**: at least 9 times — in the title, twice in the first 120 words, and 4+ more times naturally in the body; also use related/LSI terms. No keyword stuffing.
+- **Intro** (first 3 sentences): hook the reader and say why it matters.
+- **Structure**: no H1 (the metadata title is the H1); 4–6 H2 sections, optional H3; 3–5 Markdown tables (comparisons, steps, rankings, stats); bullet lists where useful; paragraphs under 120 words; end with a FAQ section of 3–4 Q&As that uses the keyword at least once.
+- **Content**: actionable tips, numbers and examples; paraphrase the sources, never copy; label community-sourced info as "player experience" or "community reports"; stay factually accurate (Google Helpful Content).
+- **Links**: exactly 1 authoritative external link (official site, Steam, major gaming media), with descriptive anchor text.
 
-## Writing Requirements
+## Output
 
-1. Write a fully original blog post, approximately 1,600 words
-2. Include the main keyword at least 9 times:
-   - Once in the title (H1)
-   - Twice within the first 120 words
-   - 4+ times naturally throughout the body
-3. Naturally incorporate semantic and LSI keywords
-4. Provide actionable tips, statistics, or examples
-5. When referencing the source material, paraphrase — do not copy verbatim
-6. Label community-sourced info as "player experience" or "community reports"
-7. Include 1 authoritative external link (official site, Steam, major gaming media)
-8. Use descriptive anchor text for all links
+Output only the MDX file — no code fences, no commentary. Start directly with:
 
-## Article Structure
-
-- Start with a JS metadata export block (see format below)
-- **Do not include an H1 heading** — the title in metadata serves as H1; start with H2 sections
-- 4–6 H2 headings, optional H3 subheadings
-- **Use Markdown tables extensively** (at least 3–5 tables) for comparisons, data, steps, rankings, stats, etc.
-- Use bullet lists where appropriate
-- Keep paragraphs under 120 words
-- End with a FAQ section (3–4 Q&A pairs, using the keyword at least once)
-
-## Introduction (first 3 sentences)
-
-- Hook the reader immediately
-- Answer "why does this matter?"
-- Include the main keyword twice in the first 120 words
-
-## Output Format
-
-Output an MDX file that begins with a JavaScript metadata export:
-
-```
 export const metadata = {
-  title: "Article Title (60–120 chars, includes keyword)",
-  description: "SEO-optimized description (max 155 chars)",
+  title: "Article title",
+  description: "SEO description, max 155 characters",
   category: "{category}",
   date: "{current_date}",
 }
-```
 
-Then the article body in standard Markdown (no code fences, no H1 heading).
-
-## Important
-
-- Do NOT wrap the article in code blocks (```)
-- Start directly with `export const metadata = {`
-- In the article body, never write a bare `{` or `}`, and never put `<` directly before a digit — MDX parses them as code and the site build fails. Write braces as `\{` and `\}` (e.g. `\{he sneezed\}`), or rephrase; write "less than 5" instead of `<5`
-- Write in natural, engaging American English
-- Follow Google "Helpful Content" guidelines
-- Focus on user value, avoid keyword stuffing
-- Ensure factual accuracy
-
-Now generate the complete article.
+then the Markdown body. In the body never write a bare `{` or `}` (write `\{` / `\}` or rephrase) and never put `<` right before a digit (write "less than 5") — MDX would parse them as code and break the site build.
