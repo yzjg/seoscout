@@ -5,6 +5,7 @@ YouTube 搜索和提取模块
 """
 
 import asyncio
+import os
 import subprocess
 import json
 import re
@@ -19,6 +20,8 @@ from .utils import format_duration, load_cache, save_cache
 
 class YouTube:
     """YouTube 搜索和提取（支持并行）"""
+
+    _gemini_lock = None
 
     def __init__(self):
         self.config = Config
@@ -279,14 +282,18 @@ class YouTube:
         if not topic_name or not videos:
             return videos
 
-        topic_lower = topic_name.lower()
+        # 标点当空格处理："BEAR (Alpha)" 要能匹配 "Roblox Bear Alpha Animation"、"BEAR (ALPHA)"
+        def _norm(s: str) -> str:
+            return ' '.join(re.sub(r'[\W_]+', ' ', s.lower()).split())
+
+        topic_lower = _norm(topic_name)
         topic_nospace = topic_lower.replace(' ', '')
         kept = []
         filtered_out = []
 
         for v in videos:
             title = v.get('title', '')
-            title_lower = title.lower()
+            title_lower = _norm(title)
             if topic_lower in title_lower or topic_nospace in title_lower:
                 kept.append(v)
             else:
@@ -405,7 +412,20 @@ class YouTube:
                 print(f"  💾 缓存命中: {item.title[:50]}...")
                 return (item, cache_data["content"])
 
-            # 2. 缓存未命中，提取内容
+            # 2. 缓存未命中，优先用 Gemini 网页转写
+            content = await self._gemini_transcript(item)
+            if content:
+                save_cache(item.video_id, "youtube", {
+                    "title": item.title,
+                    "url": item.url,
+                    "video_id": item.video_id,
+                    "content": content,
+                    "source_type": "youtube",
+                    "transcript_source": "gemini"
+                }, title=item.title)
+                return (item, content)
+
+            # 3. Gemini 失败，回退 youtube_transcript_api
             for attempt in range(self.config.YOUTUBE_RETRIES):
                 try:
                     # 在线程池中运行同步代码
@@ -434,6 +454,71 @@ class YouTube:
                         print(f"    ✗ {item.video_id}: 重试{self.config.YOUTUBE_RETRIES}次后失败")
                         return (item, "")
                     await asyncio.sleep(2 ** attempt)
+
+    async def _gemini_transcript(self, item: YouTubeItem) -> str:
+        """
+        调 gemini-browser/query.py 让 Gemini 网页转写视频（失败返回空串，由调用方回退）
+
+        同一个 Chrome 只能串行操作 Gemini 页面，所有视频共用一把锁。
+
+        Args:
+            item: YouTubeItem 对象
+
+        Returns:
+            去掉时间戳的转写文本
+        """
+        if not self.config.GEMINI_TRANSCRIPT:
+            return ""
+        script = self.config.GEMINI_QUERY_SCRIPT
+        if not os.path.exists(script):
+            print(f"    ⚠️ Gemini 脚本不存在: {script}，改用原字幕接口")
+            return ""
+
+        if YouTube._gemini_lock is None:
+            YouTube._gemini_lock = asyncio.Lock()
+
+        payload = {
+            "youtube_url": f"https://www.youtube.com/watch?v={item.video_id}",
+            "cdp_port": self.config.GEMINI_CDP_PORT,
+            "attempts": self.config.GEMINI_ATTEMPTS,
+        }
+        if self.config.GEMINI_TRANSCRIPT_MODEL:
+            payload["model"] = self.config.GEMINI_TRANSCRIPT_MODEL
+        if item.duration_seconds:
+            payload["duration_seconds"] = int(item.duration_seconds)
+
+        async with YouTube._gemini_lock:
+            print(f"  🤖 Gemini 转写: {item.title[:50]}...")
+            proc = await asyncio.create_subprocess_exec(
+                self.config.GEMINI_PYTHON, script,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(
+                    proc.communicate(json.dumps(payload).encode()),
+                    timeout=self.config.GEMINI_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                print(f"    ⚠️ {item.video_id}: Gemini 超时（{self.config.GEMINI_TIMEOUT}s），改用原字幕接口")
+                return ""
+
+        try:
+            result = json.loads(stdout.decode().strip().splitlines()[-1])
+        except Exception:
+            print(f"    ⚠️ {item.video_id}: Gemini 输出无法解析，改用原字幕接口")
+            return ""
+        if result.get("error") or not result.get("answer"):
+            print(f"    ⚠️ {item.video_id}: Gemini 失败（{str(result.get('error'))[:80]}），改用原字幕接口")
+            return ""
+
+        lines = [re.sub(r"^\[[\d:]+\]\s*", "", line).strip() for line in result["answer"].splitlines()]
+        content = "\n".join(line for line in lines if line)
+        print(f"    ✓ {item.video_id}: Gemini 转写 {result.get('segments')} 段，{len(content)} 字")
+        return content
 
     def _get_transcript(self, video_id: str) -> str:
         """

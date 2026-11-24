@@ -14,8 +14,13 @@ from datetime import datetime
 from pathlib import Path
 
 from .core.config import Config
-from .core.llm_client import LLMClient
+from .core.llm_client import LLMClient, mdx_shape_error, body_word_count
+from .core.mdx import escape_mdx_body, strip_preamble
 from .core.utils import load_json, save_json, ensure_dir
+from .core.variants import build_variants, variants_block
+
+# Extra tries for a draft that fails the checks (too short, no structure): 3 attempts in total
+REPAIR_ROUNDS = 2
 
 
 # ── helpers ─────────────────────────────────────────────────────
@@ -42,9 +47,18 @@ def load_prompt_template(prompt_path: str = None) -> str:
         return f.read()
 
 
+def fill_template(template: str, **values) -> str:
+    """Replace only {merged_data} / {current_date} / {category} / {keyword_variants}; other braces in the
+    template (e.g. the `export const metadata = { ... }` example) stay as written.
+    str.format() would treat those braces as fields and raise KeyError."""
+    pattern = re.compile(r"\{(" + "|".join(map(re.escape, values)) + r")\}")
+    # single pass: inserted material is never scanned for placeholders again
+    return pattern.sub(lambda m: str(values[m.group(1)]), template)
+
+
 def clean_llm_output(content: str) -> str:
-    """Strip code fences and trim."""
-    content = content.strip()
+    """Drop any preamble before the metadata, strip code fences, trim, and escape bare MDX braces / `<` in the body."""
+    content = strip_preamble(content.strip())
     if content.startswith('```markdown'):
         content = content[len('```markdown'):].lstrip('\n')
     elif content.startswith('```md'):
@@ -53,24 +67,17 @@ def clean_llm_output(content: str) -> str:
         content = content[3:].lstrip('\n')
     if content.rstrip().endswith('```'):
         content = content.rstrip()[:-3].rstrip()
-    return content
+    return escape_mdx_body(content)
 
 
-def validate_markdown(content: str) -> tuple:
-    """Basic Markdown validation. Returns (is_valid, error_msg)."""
+def validate_markdown(content: str, min_words: int = 0) -> tuple:
+    """Gate before saving, for every channel (web answers and the LLM_PROVIDER fallback alike): the same
+    strict shape rules as code_before's format check, plus the body word floor when min_words > 0.
+    Returns (is_valid, error_msg); a failure goes to the repair round instead of being saved."""
     if not content or not content.strip():
         return False, "Empty content"
-    # Must have some heading or JS export metadata
-    has_structure = (
-        'export const metadata' in content[:200]
-        or '## ' in content
-        or '# ' in content
-    )
-    if not has_structure:
-        return False, "No heading or metadata export found"
-    if len(content) < 200:
-        return False, f"Content too short ({len(content)} chars)"
-    return True, ""
+    err = mdx_shape_error(content, min_words=min_words)
+    return (not err), err
 
 
 # ── main logic ──────────────────────────────────────────────────
@@ -126,6 +133,18 @@ async def run_generate(
         print("  ❌ No keywords found")
         return
 
+    # Search variants (spelling / plural / word order / synonyms) per keyword, from the raw
+    # long-tail files next to the keywords JSON; raises if claude -p fails (no made-up variants)
+    meta_dir = os.path.dirname(os.path.abspath(keywords_file))
+    try:
+        topic = load_json(keywords_file).get('topic_name', '')
+    except (OSError, ValueError, AttributeError):
+        topic = ''
+    variants = build_variants(
+        meta_dir, keyword_entries, topic or os.path.basename(meta_dir),
+        raw_dir=f"{Config.OUT_DIR}/cache/variants-claude-p",
+        template_path=str(Path(__file__).parent / "templates" / "keyword-variants.md"))
+
     if test:
         keyword_entries = keyword_entries[:2]
         print(f"  🧪 TEST MODE: {len(keyword_entries)} keywords\n")
@@ -174,10 +193,12 @@ async def run_generate(
         current_date = datetime.now().strftime('%Y-%m-%d')
         cat_slug_final = cat_slug if category else "general"
 
-        prompt = prompt_template.format(
+        prompt = fill_template(
+            prompt_template,
             merged_data=merged_json,
             current_date=current_date,
             category=cat_slug_final,
+            keyword_variants=variants_block(variants.get(keyword)),
         )
 
         prompts.append((prompt, {'keyword': keyword, 'slug': slug, 'output_path': output_path}))
@@ -193,61 +214,55 @@ async def run_generate(
 
     print(f"\n  📝 Generating {len(prompts)} articles...")
     print(f"     Batch size: {Config.GENERATE_BATCH_SIZE}")
-    print(f"     Model: {Config.LLM_MODEL}\n")
+    print(f"     Model: {Config.llm_label()}")
+    web = Config.web_channels('generate')
+    print(f"     Order: {' → '.join([ch['title'] for ch in web] + [Config.LLM_PROVIDER])}\n")
 
-    # Generate
-    client = LLMClient()
-    results = await client.generate_batch(prompts)
+    # Generate: Yuanbao web → Doubao web → Gemini web → Kimi web → DeepSeek web → Grok web → LLM_PROVIDER
+    client = LLMClient(web=web)
+    min_words = Config.GENERATE_MIN_WORDS
+    # Web answers (Yuanbao / Doubao / Gemini / Kimi / DeepSeek / Grok) must pass this (shape + word floor), else the next one in the order
+    web_check = lambda c: mdx_shape_error(clean_llm_output(c), min_words=min_words)
+    prompt_of = {meta['output_path']: prompt for prompt, meta in prompts}
+    results = await client.generate_batch(prompts, validator=web_check)
 
-    # Save results with repair
+    # Save results; a draft that fails the checks is rewritten, up to REPAIR_ROUNDS times
     saved = 0
     failed = 0
-    repair_prompts = []
 
-    for meta, content in results:
-        if not content:
-            failed += 1
-            continue
-
-        cleaned = clean_llm_output(content)
-        is_valid, err = validate_markdown(cleaned)
-
-        if is_valid:
-            output_path = meta['output_path']
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write(cleaned)
-            saved += 1
-            print(f"  ✅ {meta['slug']}.mdx")
-        else:
-            # Queue for repair
-            repair_prompt = _build_repair_prompt(prompt_template, meta, cleaned, err)
-            repair_prompts.append((repair_prompt, meta))
-
-    # Repair pass
-    if repair_prompts:
-        print(f"\n  🔧 Repairing {len(repair_prompts)} articles...")
-        repair_results = await client.generate_batch(
-            repair_prompts,
-            batch_size=min(10, len(repair_prompts)),
-        )
-
-        for meta, content in repair_results:
+    for attempt in range(REPAIR_ROUNDS + 1):
+        repair_prompts = []
+        for meta, content in results:
             if not content:
                 failed += 1
                 continue
+
             cleaned = clean_llm_output(content)
-            is_valid, err = validate_markdown(cleaned)
+            is_valid, err = validate_markdown(cleaned, min_words)
+
             if is_valid:
                 output_path = meta['output_path']
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
                 with open(output_path, 'w', encoding='utf-8') as f:
                     f.write(cleaned)
                 saved += 1
-                print(f"  ✅ (repaired) {meta['slug']}.mdx")
+                # [via 模型]：最终存下的这一版是谁写的（wiki-insights 汇总按它统计每个模型通过篇数）
+                print(f"  ✅ {'(repaired) ' if attempt else ''}{meta['slug']}.mdx ({body_word_count(cleaned)} words) [via {meta.get('source', '?')}]")
+            elif attempt < REPAIR_ROUNDS:
+                print(f"  ⚠️  {meta['slug']}.mdx rejected: {err}")
+                repair_prompts.append((_build_repair_prompt(prompt_of[meta['output_path']], err), meta))
             else:
                 failed += 1
-                print(f"  ❌ {meta['slug']}.mdx — still invalid after repair")
+                print(f"  ❌ {meta['slug']}.mdx — still invalid after {REPAIR_ROUNDS} repairs, not saved: {err}")
+
+        if not repair_prompts:
+            break
+        print(f"\n  🔧 Repairing {len(repair_prompts)} articles (round {attempt + 1}/{REPAIR_ROUNDS})...")
+        results = await client.generate_batch(
+            repair_prompts,
+            batch_size=min(10, len(repair_prompts)),
+            validator=web_check,
+        )
 
     # Summary
     print("\n" + "=" * 70)
@@ -260,15 +275,15 @@ async def run_generate(
     print("=" * 70)
 
 
-def _build_repair_prompt(template: str, meta: dict, content: str, error: str) -> str:
-    """Build a repair prompt asking LLM to fix the invalid output."""
-    keyword = meta.get('keyword', 'unknown')
+def _build_repair_prompt(prompt: str, error: str) -> str:
+    """The original prompt (it carries the reference material, so the rewrite stays sourced) plus what
+    was wrong with the previous draft."""
     return (
-        f"The previous article draft for keyword \"{keyword}\" had issues:\n"
-        f"  Error: {error}\n\n"
-        f"Previous draft (for reference, do NOT repeat the same mistakes):\n"
-        f"{content[:2000]}\n\n"
-        f"Regenerate a COMPLETE article from scratch. Fix the issues above.\n"
-        f"Output ONLY valid MDX starting with `export const metadata = {{`.\n"
-        f"Do NOT wrap in code blocks."
+        prompt
+        + "\n\n---\n\n"
+        f"Your previous draft was rejected: {error}.\n"
+        "Write the COMPLETE article again from the reference material above and fix that problem. "
+        "If it was too short, cover each section in more depth with facts from the reference material "
+        "(no padding, no repetition) and aim well above the minimum.\n"
+        "Output ONLY valid MDX starting with `export const metadata = {`. Do NOT wrap in code blocks."
     )

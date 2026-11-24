@@ -14,8 +14,10 @@ from string import Template
 from datetime import datetime
 
 from .core.config import Config
-from .core.llm_client import LLMClient
-from .core.utils import ensure_dir
+from .core.llm_client import LLMClient, mdx_shape_error, heading_levels, english_paragraphs
+from .core.google_translate import GoogleTranslator
+from .core.mdx import escape_mdx_body, strip_preamble
+from .core.utils import SOURCE_LANGUAGE, ensure_dir, load_json, target_languages
 
 
 # ── language map ────────────────────────────────────────────────
@@ -54,8 +56,8 @@ def load_prompt_template(prompt_path: str = None) -> str:
 
 
 def clean_llm_output(content: str) -> str:
-    """Strip code fences (handles any language tag like ```javascript, ```mdx, etc.)."""
-    content = content.strip()
+    """Drop any preamble before the metadata, strip code fences (handles any language tag like ```javascript, ```mdx, etc.) and escape bare MDX braces / `<` in the body."""
+    content = strip_preamble(content.strip())
     # Match opening code fence with optional language tag (e.g. ```javascript, ```mdx, ```markdown)
     if content.startswith('```'):
         first_newline = content.find('\n')
@@ -65,23 +67,16 @@ def clean_llm_output(content: str) -> str:
             content = content[3:]
     if content.rstrip().endswith('```'):
         content = content.rstrip()[:-3].rstrip()
-    return content
+    return escape_mdx_body(content)
 
 
 def validate_markdown(content: str) -> tuple:
-    """Basic check: non-empty, has structure (JS export metadata or headings)."""
+    """Gate before saving, for every channel: the same strict shape rules as code_before's format check
+    (min_body=200 as in web_check). Returns (is_valid, error_msg); a failure goes to the repair attempt."""
     if not content or not content.strip():
         return False, "Empty content"
-    has_structure = (
-        'export const metadata' in content[:200]
-        or '## ' in content
-        or '# ' in content
-    )
-    if not has_structure:
-        return False, "No heading or metadata export found"
-    if len(content) < 100:
-        return False, f"Too short ({len(content)} chars)"
-    return True, ""
+    err = mdx_shape_error(content, min_body=200)
+    return (not err), err
 
 
 # ── main logic ──────────────────────────────────────────────────
@@ -92,6 +87,7 @@ async def run_translate(
     prompt_path: str = None,
     overwrite: bool = False,
     test: bool = False,
+    keywords_file: str = None,
 ):
     """
     Translate English articles to target languages.
@@ -102,6 +98,7 @@ async def run_translate(
         prompt_path: Optional custom prompt template
         overwrite: Overwrite existing translations
         test: Only translate 1 article
+        keywords_file: keywords JSON; its topic_name (the game) is kept untranslated by Google Translate
     """
     Config.init(project)
 
@@ -109,10 +106,14 @@ async def run_translate(
     print(f"  Step 4: Translate [{project}]")
     print("=" * 70)
 
-    # Parse languages (any code accepted, name resolved from map or title-cased)
-    target_langs = [l.strip() for l in lang.split(',') if l.strip()]
+    # Parse languages (any code accepted, name resolved from map or title-cased).
+    # English is the source: translating it would overwrite articles/en, so it is always ignored.
+    requested = [l.strip() for l in lang.split(',') if l.strip()]
+    target_langs = target_languages(requested)
+    if any(l.lower() == SOURCE_LANGUAGE for l in requested):
+        print(f"  ℹ️  Ignored '{SOURCE_LANGUAGE}' (source language, articles/en is the original)")
     if not target_langs:
-        print("  ❌ No target languages specified")
+        print("  ℹ️  No target languages other than English — nothing to translate")
         return
 
     resolved_names = {l: LANG_NAMES.get(l, l.upper()) for l in target_langs}
@@ -197,11 +198,69 @@ async def run_translate(
     print(f"  📝 {len(all_tasks)} translation tasks\n")
     print(f"     Batch size: {Config.TRANSLATE_BATCH_SIZE}")
     print(f"     Batch delay: {Config.TRANSLATE_BATCH_DELAY}s")
-    print(f"     Model: {Config.LLM_MODEL}\n")
+    print(f"     Model: {Config.llm_label(translate=True)}")
+    web = Config.web_channels('translate')
+    order = ['Google Translate'] if Config.GOOGLE_TRANSLATE else []
+    order += [ch['title'] for ch in web] + [Config.LLM_PROVIDER]
+    print(f"     Order: {' → '.join(order)}\n")
 
     # Execute in batches
-    client = LLMClient()
-    client.stats['start_time'] = asyncio.get_event_loop().time() if hasattr(asyncio, 'get_event_loop') else __import__('time').time()
+    client = LLMClient(Config.CLAUDE_CLI_TRANSLATE_MODEL, Config.CLAUDE_CLI_TRANSLATE_EFFORT, web=web)
+
+    def web_check(en_content):
+        """A web / Google translation must be a whole MDX article with the English heading structure."""
+        want = heading_levels(en_content)
+        meta_line = lambda s, k: (re.search(rf'^\s*{k}\s*:\s*(.+)$', s, re.M) or [None, ''])[1].strip()
+        en_title, en_desc = meta_line(en_content, 'title'), meta_line(en_content, 'description')
+
+        def check(content):
+            cleaned = clean_llm_output(content)
+            err = mdx_shape_error(cleaned, min_body=200)
+            if err:
+                return err
+            got = heading_levels(cleaned)
+            if got != want:
+                return f"headings {len(got)} != English {len(want)}"
+            # Gemini sometimes leaves metadata in English (seen on ja) → reject, Claude retranslates
+            if en_title and meta_line(cleaned, 'title') == en_title:
+                return "metadata title left untranslated"
+            if en_desc and meta_line(cleaned, 'description') == en_desc:
+                return "metadata description left untranslated"
+            # Gemini sometimes translates only the metadata and keeps body paragraphs in English (seen on fr)
+            left, total = english_paragraphs(cleaned)
+            if left:
+                return f"body left in English ({left}/{total} paragraphs)"
+            return ""
+        return check
+    client.stats['start_time'] = __import__('time').time()  # same clock as print_stats (time.time)
+
+    # Order per article: Google Translate → Grok web → Gemini web → fallback provider. An article that one
+    # of them cannot deliver (no answer after its retries, or a result that fails web_check) goes to the next
+    google = None
+    if Config.GOOGLE_TRANSLATE:
+        topic = ''
+        if keywords_file:
+            try:
+                topic = (load_json(keywords_file) or {}).get('topic_name', '')
+            except (OSError, ValueError):
+                pass
+        google = GoogleTranslator(topic, [p.read_text(encoding='utf-8') for p in articles])
+        if google.studios:
+            print(f"  🔒 Studio names kept as written: {', '.join(google.studios)}")
+        if not topic:
+            print("  ⚠️  No topic_name in the keywords JSON: the game name is not protected in Google Translate")
+
+    async def translate_one(session, t):
+        check = web_check(t['en_content'])
+        meta = {'keyword': t['article_name'], 'language': t['lang']}
+        label = f"[{t['lang']}] {t['article_name']}"
+        if google and not google.disabled:
+            content = await google.translate_article(t['en_content'], t['lang'], label, check)
+            if content:
+                return content
+            print(f"  ↩️  Google Translate → next in order: {label}")
+        # Then the web channels in order (Grok web → Gemini web) → fallback provider
+        return await client.generate_single(session, t['prompt'], meta, check)
 
     batch_size = Config.TRANSLATE_BATCH_SIZE
     batch_delay = Config.TRANSLATE_BATCH_DELAY
@@ -216,13 +275,7 @@ async def run_translate(
 
             print(f"  📦 Batch {batch_num}/{total_batches} ({len(batch)} tasks)...")
 
-            tasks = [
-                client.generate_single(session, t['prompt'], {
-                    'keyword': t['article_name'],
-                    'language': t['lang'],
-                })
-                for t in batch
-            ]
+            tasks = [translate_one(session, t) for t in batch]
             results = await asyncio.gather(*tasks)
 
             for task_info, content in zip(batch, results):
@@ -252,6 +305,7 @@ async def run_translate(
                     repaired = await client.generate_single(
                         session, repair_prompt,
                         {'keyword': article_name, 'language': lang_code},
+                        web_check(task_info['en_content']),
                     )
                     if repaired:
                         cleaned = clean_llm_output(repaired)
@@ -279,6 +333,9 @@ async def run_translate(
         lang_dir = Path(Config.DATA_DIR) / "articles" / lang_code
         count = len(list(lang_dir.glob("**/*.mdx"))) if lang_dir.exists() else 0
         print(f"  {resolved_names[lang_code]} ({lang_code}): {count} files")
+    if google:
+        google.print_stats()
+        await google.close()
     client.print_stats()
     print("=" * 70)
 

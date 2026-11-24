@@ -115,6 +115,34 @@ def load_keywords_from_json(json_file: str) -> List[Dict]:
     return results
 
 
+SOURCE_LANGUAGE = "en"
+
+
+def target_languages(langs: List[str]) -> List[str]:
+    """Translation targets: drop the source language (en — articles are written in English),
+    blanks and duplicates, keeping the given order."""
+    out = []
+    for l in langs or []:
+        code = l.strip() if isinstance(l, str) else ""
+        if code and code.lower() != SOURCE_LANGUAGE and code not in out:
+            out.append(code)
+    return out
+
+
+def load_languages_file(path: str) -> List[str]:
+    """Read a languages.json ({"languages": ["en", "de", ...]}). Raises ValueError when the
+    file is missing, not JSON, or has no non-empty "languages" string array."""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        raise ValueError(f"cannot read languages file {path}: {e}")
+    langs = data.get("languages") if isinstance(data, dict) else None
+    if not isinstance(langs, list) or not langs or not all(isinstance(l, str) and l.strip() for l in langs):
+        raise ValueError(f"{path}: 'languages' must be a non-empty array of language codes")
+    return [l.strip() for l in langs]
+
+
 def load_languages_from_json(json_file: str) -> List[str]:
     """
     Load target languages from a keywords JSON file.
