@@ -267,13 +267,14 @@ async def _run_collect(args):
 async def _run_generate(args) -> bool:
     from .generate import run_generate
     from .verify import run_check
-    await run_generate(
+    if not await run_generate(
         args.project,
         args.keywords,
         prompt_path=args.prompt,
         overwrite=args.overwrite,
         test=args.test,
-    )
+    ):
+        return False
     if args.test:
         print("  🧪 TEST MODE: one-keyword-one-page check skipped")
         return True
@@ -313,12 +314,13 @@ async def _run_all(args) -> bool:
 
     await run_search(args.project, args.keywords)
     await run_collect(args.project)
-    await run_generate(
+    if not await run_generate(
         args.project,
         args.keywords,
         prompt_path=args.prompt,
         overwrite=args.overwrite,
-    )
+    ):
+        return False
 
     # Translate when --languages-file or the keywords JSON lists languages other than English
     langs = args.target_langs

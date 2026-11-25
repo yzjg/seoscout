@@ -13,7 +13,7 @@ from urllib.parse import urlparse, unquote, quote
 
 from .config import Config
 from .models import WebItem
-from .utils import is_blocked_domain, load_cache, save_cache, get_url_hash
+from .utils import is_blocked_domain, load_cache, save_cache, get_url_hash, source_problem
 from .cleaner import ContentCleaner
 
 
@@ -392,11 +392,11 @@ class Web:
         url_hash = get_url_hash(item.url)
         if self.config.GEMINI_WEB_READ:
             cache_data = load_cache(url_hash, "web", title=item.title)
-            if cache_data and cache_data.get("content"):
+            if cache_data and cache_data.get("content") and not source_problem(cache_data["content"]):
                 print(f"  💾 缓存命中: {item.title[:50]}...")
                 return (item, cache_data["content"])
             content = await self._read_gemini(item)
-            if content:
+            if content and not source_problem(content):
                 cleaned_content = self.cleaner.clean(content)
                 save_cache(url_hash, "web", {"title": item.title, "url": item.url, "domain": item.domain,
                                              "content": cleaned_content, "source_type": "web",
@@ -407,7 +407,7 @@ class Web:
             # 1. 检查缓存
             url_hash = get_url_hash(item.url)
             cache_data = load_cache(url_hash, "web", title=item.title)
-            if cache_data and cache_data.get("content"):
+            if cache_data and cache_data.get("content") and not source_problem(cache_data["content"]):
                 print(f"  💾 缓存命中: {item.title[:50]}...")
                 return (item, cache_data["content"])
 
@@ -462,12 +462,13 @@ class Web:
                             else:
                                 content = await response.text()
 
-                            # 内容长度检查
-                            if len(content.strip()) < 500:
+                            # 拦截页 / 内容过短：重试，仍不行就当抓取失败（不缓存，下次重抓）
+                            problem = source_problem(content)
+                            if problem:
                                 if attempt < self.config.WEB_EXTRACT_RETRIES - 1:
                                     await asyncio.sleep(2 ** attempt)
                                     continue
-                                print(f"    ⚠️ {source} 内容过短 ({len(content.strip())} 字符): {item.url[:80]}")
+                                print(f"    ⚠️ {source} {problem}: {item.url[:80]}")
                                 return (item, "")
 
                             # 清理内容（移除导航链接、广告等）

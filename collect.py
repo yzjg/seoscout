@@ -17,11 +17,21 @@ from .core.config import Config
 from .core.youtube import YouTube
 from .core.web import Web
 from .core.models import YouTubeItem, WebItem
-from .core.utils import load_json, save_json, ensure_dir
+from .core.utils import load_json, save_json, ensure_dir, source_problem
 
 
 def keyword_to_filename(keyword: str) -> str:
     return re.sub(r'[^a-z0-9_]', '', keyword.lower().replace(' ', '_').replace('/', '_'))
+
+
+def has_usable_source(path: str) -> bool:
+    """资料包里至少有一条不是拦截页、不是空内容的来源；否则续跑时要重新抓。"""
+    try:
+        srcs = load_json(path).get("sources", {})
+    except (OSError, ValueError, AttributeError):
+        return False
+    items = srcs.get("youtube", {}).get("videos", []) + srcs.get("web", {}).get("pages", [])
+    return any(not source_problem(x.get("content", "")) for x in items)
 
 
 def deduplicate_items(items_by_keyword, item_type="video"):
@@ -85,7 +95,7 @@ async def run_collect(project: str):
             collected_path = f"{collected_dir}/{category_slug}/{keyword_file}.json"
         else:
             collected_path = f"{collected_dir}/{keyword_file}.json"
-        if os.path.exists(collected_path):
+        if os.path.exists(collected_path) and has_usable_source(collected_path):
             skipped_count += 1
             continue
 
@@ -145,6 +155,20 @@ async def run_collect(project: str):
         yt.extract_batch(yt_items),
         web.extract_batch(web_items)
     )
+
+    # 拦截页 / 空字幕 / 几乎没正文的资料不算抓到：丢掉并当作失败统计，不进资料包
+    def usable(results_list, label):
+        kept = []
+        for item, content in results_list:
+            problem = source_problem(content) if content else ""
+            if problem:
+                print(f"  🚫 {label} {problem}: {item.url[:80]}")
+                content = ""
+            kept.append((item, content))
+        return kept
+
+    yt_results = usable(yt_results, "YouTube")
+    web_results = usable(web_results, "Web")
 
     results = defaultdict(lambda: {"youtube": [], "web": []})
 

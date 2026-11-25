@@ -5,6 +5,7 @@
 """
 
 import os
+import re
 import json
 import time
 from typing import List, Dict, Any
@@ -79,6 +80,31 @@ def is_blocked_domain(url: str, blocked_domains: set) -> bool:
     """
     domain = extract_domain(url)
     return any(blocked in domain for blocked in blocked_domains)
+
+
+# 资料至少要有这么多字符的真实正文（与 web 抓取的"内容过短"门槛一致）
+MIN_SOURCE_CHARS = 500
+
+# 反爬 / 限流拦截页的特征（Jina 对目标站的 403/429 仍返回 200，正文是拦截页）
+_BLOCK_PAGE = re.compile(
+    r"Target URL returned error (?:403|429|5\d\d)"
+    r"|^Title: (?:Just a moment|Attention Required|Access denied|Security check)"
+    r"|Performing security verification|Verify you are human|Checking your browser before accessing"
+    r"|Enable JavaScript and cookies to continue",
+    re.I | re.M,
+)
+# 自动字幕里的非语音标记（[Music] [Applause] foreign ...）
+_CAPTION_NOISE = re.compile(r"\[(?:music|applause|laughter|silence|__)\]|\bforeign\b", re.I)
+
+
+def source_problem(content: str) -> str:
+    """资料不能用的原因；能用返回空字符串。拦截页、几乎没有正文的页面和只有 [Music] 的字幕都不算资料。"""
+    text = (content or "").strip()
+    if _BLOCK_PAGE.search(text[:3000]):
+        return "拦截页（Cloudflare / 限流）"
+    if len(_CAPTION_NOISE.sub("", text).strip()) < MIN_SOURCE_CHARS:
+        return f"正文过短（{len(text)} 字符）"
+    return ""
 
 
 def load_keywords_from_json(json_file: str) -> List[Dict]:

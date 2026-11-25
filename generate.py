@@ -16,7 +16,7 @@ from pathlib import Path
 from .core.config import Config
 from .core.llm_client import LLMClient, mdx_shape_error, body_word_count
 from .core.mdx import escape_mdx_body, strip_preamble
-from .core.utils import load_json, save_json, ensure_dir
+from .core.utils import load_json, save_json, ensure_dir, source_problem
 from .core.variants import build_variants, variants_block
 
 # Extra tries for a draft that fails the checks (too short, no structure): 3 attempts in total
@@ -118,7 +118,7 @@ async def run_generate(
                 kw_data = json.load(f)
         except FileNotFoundError:
             print(f"  ❌ Keywords file not found: {keywords_file}")
-            return
+            return False
 
         keyword_entries = []
         if 'categories' in kw_data:
@@ -131,7 +131,7 @@ async def run_generate(
 
     if not keyword_entries:
         print("  ❌ No keywords found")
-        return
+        return False
 
     # Search variants (spelling / plural / word order / synonyms) per keyword, from the raw
     # long-tail files next to the keywords JSON; raises if claude -p fails (no made-up variants)
@@ -155,7 +155,7 @@ async def run_generate(
     ensure_dir(articles_dir)
 
     prompts = []
-    skipped_no_data = 0
+    no_material = []   # (keyword, 原因)：没有可用资料的关键词，一个都不生成，整步报错
     skipped_exists = 0
 
     for entry in keyword_entries:
@@ -175,18 +175,29 @@ async def run_generate(
             collected_path = f"{collected_dir}/{fname}.json"
             output_path = f"{articles_dir}/{slug}.mdx"
 
-        if not os.path.exists(collected_path):
-            skipped_no_data += 1
-            continue
-
         if os.path.exists(output_path) and not overwrite:
             skipped_exists += 1
             continue
 
-        # Load collected content
-        merged = load_json(collected_path)
-        if not merged or merged.get('total_sources', 0) == 0:
-            skipped_no_data += 1
+        if not os.path.exists(collected_path):
+            no_material.append((keyword, "没有资料包（collect 没抓到任何来源）"))
+            continue
+
+        # Load collected content; 旧资料包里可能存着拦截页，这里再筛一遍，只把真资料交给模型
+        merged = load_json(collected_path) or {}
+        srcs = merged.get('sources', {})
+        dropped = []
+        for kind, key in (('youtube', 'videos'), ('web', 'pages')):
+            block = srcs.get(kind, {})
+            kept = []
+            for src in block.get(key, []):
+                problem = source_problem(src.get('content', ''))
+                (dropped if problem else kept).append(f"{src.get('url', '?')[:80]} {problem}" if problem else src)
+            block[key] = kept
+            block['count'] = len(kept)
+        merged['total_sources'] = sum(srcs.get(k, {}).get('count', 0) for k in ('youtube', 'web'))
+        if merged['total_sources'] == 0:
+            no_material.append((keyword, "资料全部不可用：" + "；".join(dropped) if dropped else "资料包为空"))
             continue
 
         merged_json = json.dumps(merged, indent=2, ensure_ascii=False)
@@ -203,14 +214,20 @@ async def run_generate(
 
         prompts.append((prompt, {'keyword': keyword, 'slug': slug, 'output_path': output_path}))
 
-    if skipped_no_data > 0:
-        print(f"  ⏭️  Skipped {skipped_no_data} keywords (no collected data)")
     if skipped_exists > 0:
         print(f"  ⏭️  Skipped {skipped_exists} keywords (article exists)")
 
+    # 抓不到资料就停：不让模型凭空写"请自行核实"式的空文章
+    if no_material:
+        print(f"\n  ❌ {len(no_material)} 个关键词没有可用资料，本步不生成任何文章：")
+        for kw, why in no_material:
+            print(f"     - {kw}: {why}")
+        print("     处理：重跑 collect 补抓（被拦截的来源不会进缓存），或从关键词清单删掉这些词")
+        return False
+
     if not prompts:
         print("\n  ℹ️  Nothing to generate")
-        return
+        return True
 
     print(f"\n  📝 Generating {len(prompts)} articles...")
     print(f"     Batch size: {Config.GENERATE_BATCH_SIZE}")
@@ -273,6 +290,7 @@ async def run_generate(
     print(f"  Output:  {articles_dir}/")
     client.print_stats()
     print("=" * 70)
+    return True
 
 
 def _build_repair_prompt(prompt: str, error: str) -> str:
